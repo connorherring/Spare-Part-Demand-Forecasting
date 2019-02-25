@@ -1,6 +1,0 @@
----
-title: "secondpage"
-output: html_document
----
-Click <a href="Forecast2.html">here</a> to go to Forecast2.
-
