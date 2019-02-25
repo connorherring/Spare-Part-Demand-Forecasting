@@ -6,15 +6,14 @@ output:
   pdf_document: default
 ---
 
-```{r setup , include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
+
 
 ### This script uses historical demand data for 17,000 spare parts to forecast short-term demand. 
 #### Markov Chain transition probabilities and bootsrapping are used to deal with the intermittent naure of spare parts demand.
 
 
-```{r , include=TRUE, message=FALSE, warning=FALSE}
+
+```r
 library(ggplot2)
 library(reshape2)
 library(sqldf)
@@ -32,7 +31,8 @@ data1$Demand <- as.numeric(data1$Demand)
 ```
 
 #### Create new demand variable: zero demand = a,nonzero demand = b 
-```{r , include=TRUE}
+
+```r
 data1$Demand[is.na(data1$Demand)==TRUE] <- 0
 data1$Demand2[data1$Demand==0] <- "a"
 data1$Demand2[data1$Demand>0] <- "b"
@@ -44,7 +44,8 @@ data1$Demand2 <- as.character(data1$Demand2)
 ### Training Data:
 #### Back-up and subset to orders before April 2016.
 #### We will forecast April 2016 - July 2016 and compare to actuals 
-```{r , include=TRUE}
+
+```r
 hold <- data1
 data1 <- data1[data1$RequestDate < '2016-04-01',]
 
@@ -58,14 +59,16 @@ df_list = list(c(unique(data1$Catalog_ID)))
 ```
 
 #### Introduce multicore parallel processing 
-```{r , include=TRUE}
+
+```r
 cores <- detectCores()
 cl <- makeCluster(cores[1]-4)
 registerDoParallel(cl)
 ```
 
 #### Forecast loop for each item
-```{r , include=TRUE}
+
+```r
 resultsFinal <- data.frame(
   Catalog_ID = as.integer(),
   RequestDate = as.Date(character()),
@@ -198,7 +201,8 @@ results1$RequestDate <- as.character(results1$RequestDate)
 save <- results1
 ```
 #### Validation - compare actual demand to forecast
-```{r , include=TRUE}
+
+```r
 sample <- unique(results1$Catalog_ID)
 
 actuals <- unique(hold[hold$Catalog_ID %in% c(sample) & substr(hold$RequestDate,1,7) %in% c('2016-04','2016-05','2016-06','2016-07'), names(hold) %in% c("Catalog_ID","RequestDate", "Demand")])
@@ -210,23 +214,61 @@ results <- merge(results1, actuals, by = c("RequestDate","Catalog_ID"), all=TRUE
 ```
 
 #### Mean Absoulte Error
-```{r , include=TRUE,echo=TRUE}
+
+```r
 mean(abs(results$FcastDemand - actuals$ActualDemand))
+```
+
+```
+## [1] 2.796243
+```
+
+```r
 mean(abs(results$FcastDemand2 - actuals$ActualDemand))
+```
+
+```
+## [1] 3.694588
+```
+
+```r
 mean(abs(results$FcastDemand3 - actuals$ActualDemand))
 ```
 
+```
+## [1] 3.274547
+```
+
 #### Mean Squared Error
-```{r , include=TRUE,echo=TRUE}
+
+```r
 mean((results$FcastDemand - results$ActualDemand)^2)
+```
+
+```
+## [1] 269.9109
+```
+
+```r
 mean((results$FcastDemand2 - results$ActualDemand)^2)
+```
+
+```
+## [1] 459.9949
+```
+
+```r
 mean((results$FcastDemand3 - results$ActualDemand)^2)
+```
+
+```
+## [1] 507.2306
 ```
 
 
 #### Actual vs Forecast comparison plot
-```{r , include=TRUE,echo=TRUE}
 
+```r
 ForecastNew <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
                           RequestDate = as.Date(results$RequestDate),
                           Demand = as.numeric(results$FcastDemand),
@@ -275,11 +317,13 @@ library(ggplot2)
 ggplot(test, aes(RequestDate, Demand,group=Type, color=Type)) +
   geom_line() +
   ggtitle("Actual vs Forecasted Demand: 2016")
-
 ```
 
+![](index_files/figure-html/unnamed-chunk-9-1.png)<!-- -->
+
 #### Average demand iterations 
-```{r , include=TRUE,echo=TRUE}
+
+```r
 mean <- rowMeans(results[4:11])
 results$MeanForecast <- mean
 
@@ -305,8 +349,11 @@ ggplot(test2, aes(RequestDate, Demand,group=Type, color=Type)) +
   ggtitle("Actual vs Forecasted Demand: 2016")
 ```
 
+![](index_files/figure-html/unnamed-chunk-10-1.png)<!-- -->
+
 #### Save results 
-```{r , include=TRUE}
+
+```r
 final <- sqldf("select distinct RequestDate, Catalog_ID, Demand, ActualDemand, MeanForecast from results")
 final$RequestDate <- as.character(final$RequestDate)
 ```
