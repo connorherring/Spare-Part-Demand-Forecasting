@@ -1,0 +1,313 @@
+---
+title: "Demand Forecasting"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup , include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### This script uses historical demand data for 17,000 spare parts to forecast short-term demand. 
+#### Markov Chain transition probabilities and bootsrapping are used to deal with the intermittent naure of spare parts demand.
+
+
+```{r , include=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(reshape2)
+library(sqldf)
+library(foreach)
+library(doParallel)
+library(tsintermittent)
+library(boot)
+library(markovchain)
+
+data1 <- read.csv("DemandData.csv")
+data1 <- data1[,-c(1)]
+data1$RequestDate <- as.Date(data1$RequestDate)
+data1$Catalog_ID <- as.character(data1$Catalog_ID)
+data1$Demand <- as.numeric(data1$Demand)
+```
+
+#### Create new demand variable: zero demand = a,nonzero demand = b 
+```{r , include=TRUE}
+data1$Demand[is.na(data1$Demand)==TRUE] <- 0
+data1$Demand2[data1$Demand==0] <- "a"
+data1$Demand2[data1$Demand>0] <- "b"
+data1$Demand2[data1$Demand<0] <- "b"
+data1$Demand2 <- as.character(data1$Demand2)
+```
+
+
+### Training Data:
+#### Back-up and subset to orders before April 2016.
+#### We will forecast April 2016 - July 2016 and compare to actuals 
+```{r , include=TRUE}
+hold <- data1
+data1 <- data1[data1$RequestDate < '2016-04-01',]
+
+sixteen <- hold$Catalog_ID[substr(hold$RequestDate,1,4) == '2016' & hold$Catalog_ID %in% c(data1$Catalog_ID)]
+data1 <- data1[data1$Catalog_ID %in% c(sixteen),]
+sample <- sample(unique(data1$Catalog_ID), 1500)
+data1 <- data1[data1$Catalog_ID %in% c(sample),]
+
+# item index for loop
+df_list = list(c(unique(data1$Catalog_ID)))
+```
+
+#### Introduce multicore parallel processing 
+```{r , include=TRUE}
+cores <- detectCores()
+cl <- makeCluster(cores[1]-4)
+registerDoParallel(cl)
+```
+
+#### Forecast loop for each item
+```{r , include=TRUE}
+resultsFinal <- data.frame(
+  Catalog_ID = as.integer(),
+  RequestDate = as.Date(character()),
+  fcast = as.character(), run1000_iter1 = as.numeric())
+
+results1 <- foreach(i = 1:length(unique(data1$Catalog_ID)), .combine = rbind, .packages = 'markovchain') %dopar%  {
+  
+  data2 <- subset(data1, data1$Catalog_ID %in% df_list[[1]][i])
+  
+  data2$RequestDate <- as.Date(data2$RequestDate)
+  
+  # Step 1: fit Markov model #
+  mysequence <- data2$Demand2
+  myFitM <- markovchainFit(mysequence,confidencelevel = .95,method = "mle")
+  mc <- myFitM$estimate
+  
+  transitionMatrix = mc
+  
+  # get initial state #
+  demandToday = data2$Demand2[data2$RequestDate==max(data2$RequestDate)]
+  
+  # more accurate with more runs #
+  runs <- 1000
+  
+  # number of iterations - started with only 1, but saw improvement when doing > 1 
+  # and taking average #
+  demand_draws <- 8
+  
+  ltd_out <- c()
+  ltd_out2 <- c()
+  
+  # Step 2: forecast demand (0,1) #
+  for(run in 1:runs){
+    
+    
+    fcast_periods <- 4
+    
+    initial_state <- if(demandToday == "b"){c(0,1)}else{c(1,0)}
+    names(initial_state) <- c('a','b')
+    
+    tmat <- as.data.frame(transitionMatrix@transitionMatrix)
+    
+    # loop breaks for items that have a probability of zero in the transition matrix (ie, their historical demands are #
+    # all/almost all zero or nonzero) #
+    # solution is to make forecast either all 'a' or all 'b' #
+    if (nrow(tmat) == 1 & names(tmat) == 'a' ){
+      fcast <- c("a","a","a","a")
+      fstates <- matrix(c(1,1,1,1,0,0,0,0),nrow = 2, ncol = 2)
+    } else if (!is.na(tmat$b[2]) & (tmat$b[1] == 0 | tmat$b[2] == 0) ){
+      fcast <- c("a","a","a","a")
+      fstates <- matrix(c(1,1,1,1,0,0,0,0),nrow = 2, ncol = 2)
+    } else if (nrow(tmat) == 1 & names(tmat) == 'b' ){
+      fcast <- c("b","b","b","b")
+      fstates <- matrix(c(0,0,0,0,1,1,1,1),nrow = 2, ncol = 2)
+    } else {
+      
+      fcast <- c()
+      fstates <- matrix(nrow = fcast_periods,ncol = nrow(tmat))
+      
+      
+      
+      for(x in 1:fcast_periods){
+        current_state <- if(x == 1){initial_state}else{current_state}
+        
+        ttemp <- tmat[names(current_state)[current_state == 1],]
+        
+        new_state <- sample(names(ttemp),1,prob = ttemp)
+        
+        current_state <- ifelse(names(ttemp) == new_state,1,0)
+        names(current_state) <- names(ttemp)
+        fcast[x] <- new_state
+        fstates[x,] <- current_state
+      }
+    } 
+    
+    
+    
+    resultsTemp <- data.frame(df_list[[1]][i], RequestDate=seq(as.Date("2016/04/1"), as.Date("2016/07/1"), "month")
+                              , fcast)
+    
+    
+    #Step 3: bootstrapping - if fcast is b, assign value from sample of historical nonzero demands # 
+    for(dmddrw in 1:demand_draws){
+      d <- data2[,'Demand'][data2$Demand != 0] #(only nonzero demands used)#
+      resultsTemp$non0bs <- ifelse(resultsTemp$fcast == "a",0,d[sample(length(d),1)])
+      
+      
+      for(x in seq(1,nrow(resultsTemp))){
+        jittered <-ifelse(resultsTemp$fcast == "a",0,jitter(resultsTemp[x,'non0bs']))
+        resultsTemp[x,'non0bs'] <- jittered[x] 
+      }
+      
+      names(resultsTemp) <- ifelse(names(resultsTemp) == "non0bs",paste0("run",run,"_iter",dmddrw),names(resultsTemp))
+    }
+    
+    # Step 4: sum forecast results over horizon
+    # produce a distro of ltd based on the simulations above #
+    
+    ltd_distro <- colSums(resultsTemp[names(resultsTemp)[grepl("run",names(resultsTemp))]])
+    
+    ltd1 <- sum(resultsTemp[paste0("run",run,"_iter1")])
+    ltd_out[run] <- ltd1
+    ltd2 <- sum(ltd_distro) / length(ltd_distro)
+    ltd_out2[run] <- ltd2
+    print(paste0("Finished run ",run))
+  } 
+  
+  #resultsFinal <- rbind(resultsFinal, resultsTemp)
+  resultsTemp
+}
+
+stopCluster(cl)
+
+names(results1)[1] <- "Catalog_ID"
+names(results1)[3] <- "Demand"
+names(results1)[4] <- "FcastDemand"
+names(results1)[5] <- "FcastDemand2"
+names(results1)[6] <- "FcastDemand3"
+names(results1)[7] <- "FcastDemand4"
+names(results1)[8] <- "FcastDemand5"
+names(results1)[9] <- "FcastDemand6"
+names(results1)[10] <- "FcastDemand7"
+names(results1)[11] <- "FcastDemand8"
+
+
+results1$Catalog_ID <- as.character(results1$Catalog_ID)
+results1$Demand <- as.character(results1$Demand)
+results1$RequestDate <- as.character(results1$RequestDate)
+
+save <- results1
+```
+#### Validation - compare actual demand to forecast
+```{r , include=TRUE}
+sample <- unique(results1$Catalog_ID)
+
+actuals <- unique(hold[hold$Catalog_ID %in% c(sample) & substr(hold$RequestDate,1,7) %in% c('2016-04','2016-05','2016-06','2016-07'), names(hold) %in% c("Catalog_ID","RequestDate", "Demand")])
+names(actuals)[3] <- "ActualDemand"
+
+actuals$RequestDate <- as.character(actuals$RequestDate)
+
+results <- merge(results1, actuals, by = c("RequestDate","Catalog_ID"), all=TRUE)
+```
+
+#### Mean Absoulte Error
+```{r , include=TRUE,echo=TRUE}
+mean(abs(results$FcastDemand - actuals$ActualDemand))
+mean(abs(results$FcastDemand2 - actuals$ActualDemand))
+mean(abs(results$FcastDemand3 - actuals$ActualDemand))
+```
+
+#### Mean Squared Error
+```{r , include=TRUE,echo=TRUE}
+mean((results$FcastDemand - results$ActualDemand)^2)
+mean((results$FcastDemand2 - results$ActualDemand)^2)
+mean((results$FcastDemand3 - results$ActualDemand)^2)
+```
+
+
+#### Actual vs Forecast comparison plot
+```{r , include=TRUE,echo=TRUE}
+
+ForecastNew <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                          RequestDate = as.Date(results$RequestDate),
+                          Demand = as.numeric(results$FcastDemand),
+                          Type = as.character("Forecasted"))
+ActualNew <- data.frame(Catalog_ID = as.character(actuals$Catalog_ID),
+                        RequestDate = as.Date(actuals$RequestDate),
+                        Demand = as.numeric(actuals$ActualDemand),
+                        Type = as.character("Actual"))
+ForecastNew2 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand2),
+                           Type = as.character("Forecasted2"))
+ForecastNew3 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand3),
+                           Type = as.character("Forecasted3"))
+ForecastNew4 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand4),
+                           Type = as.character("Forecasted4"))
+ForecastNew5 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand5),
+                           Type = as.character("Forecasted5"))
+ForecastNew6 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand6),
+                           Type = as.character("Forecasted6"))
+ForecastNew7 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand7),
+                           Type = as.character("Forecasted7"))
+ForecastNew8 <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                           RequestDate = as.Date(results$RequestDate),
+                           Demand = as.numeric(results$FcastDemand8),
+                           Type = as.character("Forecasted8"))
+
+
+
+ResultsNew <- rbind(ForecastNew, ActualNew,ForecastNew2,ForecastNew3,ForecastNew4,ForecastNew5,ForecastNew6,ForecastNew7,ForecastNew8)
+
+test <- sqldf("select distinct RequestDate, Type, sum(Demand) as Demand
+              from ResultsNew
+              group by RequestDate, Type")
+library(ggplot2)
+ggplot(test, aes(RequestDate, Demand,group=Type, color=Type)) +
+  geom_line() +
+  ggtitle("Actual vs Forecasted Demand: 2016")
+
+```
+
+#### Average demand iterations 
+```{r , include=TRUE,echo=TRUE}
+mean <- rowMeans(results[4:11])
+results$MeanForecast <- mean
+
+Forecast <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                       RequestDate = as.Date(results$RequestDate),
+                       Demand = as.numeric(results$MeanForecast),
+                       Type = as.character("Forecasted"))
+Actual <- data.frame(Catalog_ID = as.character(results$Catalog_ID),
+                     RequestDate = as.Date(results$RequestDate),
+                     Demand = as.numeric(results$ActualDemand),
+                     Type = as.character("Actual"))
+
+
+
+Results2 <- rbind(Forecast,Actual)
+
+test2 <- sqldf("select distinct RequestDate, Type, sum(Demand) as Demand
+               from Results2
+               group by RequestDate, Type")
+library(ggplot2)
+ggplot(test2, aes(RequestDate, Demand,group=Type, color=Type)) +
+  geom_line() +
+  ggtitle("Actual vs Forecasted Demand: 2016")
+```
+
+#### Save results 
+```{r , include=TRUE}
+final <- sqldf("select distinct RequestDate, Catalog_ID, Demand, ActualDemand, MeanForecast from results")
+final$RequestDate <- as.character(final$RequestDate)
+```
+
+
